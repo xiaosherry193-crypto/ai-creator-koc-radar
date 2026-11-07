@@ -602,6 +602,198 @@ def request_json(url: str, timeout: int = 20) -> dict | list:
         return json.loads(response.read().decode("utf-8", errors="replace"))
 
 
+def read_youtube_api_key() -> str:
+    key = os.environ.get("YOUTUBE_API_KEY", "").strip()
+    if key:
+        return key
+    if not LOCAL_ENV_FILE.exists():
+        return ""
+    try:
+        for line in LOCAL_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            if line.startswith("YOUTUBE_API_KEY="):
+                return line.partition("=")[2].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def request_youtube_json(resource: str, params: dict[str, str | int]) -> dict:
+    api_key = read_youtube_api_key()
+    if not api_key:
+        raise RuntimeError("未配置 YOUTUBE_API_KEY")
+    query = {**params, "key": api_key}
+    payload = request_json(f"https://www.googleapis.com/youtube/v3/{resource}?{urlencode(query)}")
+    if not isinstance(payload, dict):
+        raise RuntimeError("YouTube API 返回格式异常")
+    if payload.get("error"):
+        error = payload["error"]
+        message = error.get("message") if isinstance(error, dict) else str(error)
+        raise RuntimeError(f"YouTube API：{message or '请求失败'}")
+    return payload
+
+
+def extract_youtube_initial_data(page: str) -> dict:
+    """Extract the public search data embedded in a YouTube HTML page."""
+    patterns = (
+        r"var ytInitialData\s*=\s*(\{.*?\});</script>",
+        r"ytInitialData\s*=\s*(\{.*?\});</script>",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page, flags=re.DOTALL)
+        if not match:
+            continue
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise RuntimeError("YouTube 公开搜索页暂时没有返回结果")
+
+
+def youtube_runs_text(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    runs = value.get("runs")
+    if isinstance(runs, list):
+        return clean_text("".join(str(item.get("text", "")) for item in runs if isinstance(item, dict)))
+    simple_text = value.get("simpleText")
+    return clean_text(str(simple_text or ""))
+
+
+def iter_youtube_renderers(value: object, renderer_name: str) -> Iterable[dict]:
+    if isinstance(value, dict):
+        renderer = value.get(renderer_name)
+        if isinstance(renderer, dict):
+            yield renderer
+        for child in value.values():
+            yield from iter_youtube_renderers(child, renderer_name)
+    elif isinstance(value, list):
+        for child in value:
+            yield from iter_youtube_renderers(child, renderer_name)
+
+
+def youtube_channel_metadata(channel_url: str) -> tuple[int | None, str]:
+    """Read subscriber count and description when the public channel page exposes them."""
+    about_url = channel_url.rstrip("/") + "/about"
+    try:
+        page = request_text(about_url, timeout=15)
+    except (HTTPError, URLError, TimeoutError, OSError):
+        return None, ""
+    subscriber_match = re.search(
+        r"([0-9]+(?:[.,][0-9]+)?\s*(?:K|M|B|万|千)?)\s*(?:subscribers|subscriber|位订阅者|订阅者)",
+        page,
+        flags=re.IGNORECASE,
+    )
+    subscribers = parse_metric(subscriber_match.group(1)) if subscriber_match else None
+    parser = MetaParser()
+    parser.feed(page[:1_500_000])
+    description = parser.meta.get("description") or parser.meta.get("og:description", "")
+    if not description:
+        description_match = re.search(r'"description"\s*:\s*\{"simpleText":"(.*?)"\}', page)
+        if description_match:
+            description = bytes(description_match.group(1), "utf-8").decode("unicode_escape", errors="ignore")
+    return subscribers, clean_text(description)
+
+
+def search_youtube_public(keywords: list[str], limit: int) -> tuple[list[Lead], list[str]]:
+    """Find public YouTube creator channels without requiring an API key."""
+    channel_rows: dict[str, dict] = {}
+    errors: list[str] = []
+    max_results = min(20, max(8, limit // 2))
+
+    for keyword in keywords:
+        search_url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
+        try:
+            page = request_text(search_url, timeout=25)
+            payload = extract_youtube_initial_data(page)
+        except Exception as error:
+            errors.append(f"YouTube {keyword}: {error}")
+            continue
+        for video in list(iter_youtube_renderers(payload, "videoRenderer"))[:max_results]:
+            video_id = clean_text(str(video.get("videoId") or ""))
+            if not video_id:
+                continue
+            owner = video.get("longBylineText") or video.get("ownerText") or {}
+            runs = owner.get("runs") if isinstance(owner, dict) else []
+            first_run = runs[0] if isinstance(runs, list) and runs and isinstance(runs[0], dict) else {}
+            endpoint = first_run.get("navigationEndpoint") or {}
+            browse_endpoint = endpoint.get("browseEndpoint") or {}
+            channel_id = clean_text(str(browse_endpoint.get("browseId") or ""))
+            if not channel_id:
+                continue
+            command = endpoint.get("commandMetadata") or {}
+            web_metadata = command.get("webCommandMetadata") or {}
+            relative_url = clean_text(str(web_metadata.get("url") or ""))
+            owner_name = youtube_runs_text(owner) or channel_id
+            row = channel_rows.setdefault(
+                channel_id,
+                {
+                    "channel_id": channel_id,
+                    "channel_name": owner_name,
+                    "channel_url": urljoin("https://www.youtube.com", relative_url) if relative_url else f"https://www.youtube.com/channel/{channel_id}",
+                    "videos": {},
+                    "keywords": set(),
+                },
+            )
+            row["videos"][video_id] = {
+                "title": youtube_runs_text(video.get("title") or {}),
+                "view_count": parse_metric(youtube_runs_text(video.get("viewCountText") or {})),
+                "published": youtube_runs_text(video.get("publishedTimeText") or {}),
+            }
+            row["keywords"].add(keyword)
+        time.sleep(0.2)
+
+    leads: list[Lead] = []
+    rows = sorted(channel_rows.values(), key=lambda item: (-len(item["videos"]), item["channel_name"].lower()))[: max(limit, 50)]
+    for row in rows:
+        name = clean_text(row["channel_name"])
+        profile_url = row["channel_url"]
+        subscribers, description = youtube_channel_metadata(profile_url)
+        if not likely_individual_creator(name, description, "youtube"):
+            continue
+        videos = list(row["videos"].items())
+        videos.sort(key=lambda item: item[1].get("view_count") or 0, reverse=True)
+        views = [item[1]["view_count"] for item in videos if item[1].get("view_count") is not None]
+        work_urls = [f"https://www.youtube.com/watch?v={video_id}" for video_id, _ in videos[:8]]
+        lead = make_lead(
+            platform="youtube",
+            name=name,
+            handle=profile_url.rstrip("/").rsplit("/", 1)[-1],
+            profile_url=profile_url,
+            bio=description or "YouTube 公开频道（无需 API 抓取）",
+            source_query="、".join(sorted(row["keywords"])),
+            source_url=work_urls[0] if work_urls else profile_url,
+            featured_work_urls=work_urls,
+            followers=subscribers,
+            related_posts=len(videos),
+            min_views=max(views) if views else None,
+        )
+        lead.follower_verified = subscribers is not None
+        lead.follower_verified_at = datetime.now(timezone.utc).isoformat(timespec="seconds") if subscribers is not None else ""
+        lead.follower_source = "YouTube 公开频道页" if subscribers is not None else ""
+        lead.data_quality = "YouTube 公开搜索页"
+        lead.activity_feedback = (
+            f"相关视频 {len(videos)} 条；最高公开播放 {max(views):,}"
+            if views
+            else f"相关视频 {len(videos)} 条；播放量待核验"
+        )
+        lead.verification_status = qualification_status(lead)
+        leads.append(lead)
+        if len(leads) >= limit:
+            break
+        time.sleep(0.15)
+
+    return sorted(leads, key=lambda item: (-item.score, -item.activity_score, item.handle.lower()))[:limit], errors
+
+
+def search_youtube(keywords: list[str], limit: int) -> tuple[list[Lead], list[str]]:
+    """Use the official API when configured, otherwise use public YouTube HTML."""
+    if read_youtube_api_key():
+        return search_youtube_api(keywords, limit)
+    return search_youtube_public(keywords, limit)
+
+
 def read_x_bearer_token() -> str:
     token = os.environ.get("X_BEARER_TOKEN", "").strip()
     if token:
@@ -949,6 +1141,144 @@ def search_reddit(keywords: list[str], limit: int) -> tuple[list[Lead], list[str
     return sorted(leads, key=lambda item: (-item.related_posts if item.related_posts is not None else 0, -item.score))[:limit], errors
 
 
+def search_youtube_api(keywords: list[str], limit: int) -> tuple[list[Lead], list[str]]:
+    """Find individual creator channels through the official YouTube Data API."""
+    channel_rows: dict[str, dict] = {}
+    errors: list[str] = []
+    max_results = min(50, max(10, limit))
+
+    for keyword in keywords:
+        try:
+            payload = request_youtube_json(
+                "search",
+                {
+                    "part": "snippet",
+                    "q": keyword,
+                    "type": "video",
+                    "order": "relevance",
+                    "maxResults": max_results,
+                },
+            )
+        except Exception as error:
+            errors.append(f"YouTube {keyword}: {error}")
+            continue
+        for item in payload.get("items", []):
+            snippet = item.get("snippet") or {}
+            channel_id = str(snippet.get("channelId") or "").strip()
+            video_id = str((item.get("id") or {}).get("videoId") or "").strip()
+            if not channel_id or not video_id:
+                continue
+            row = channel_rows.setdefault(
+                channel_id,
+                {
+                    "channel_id": channel_id,
+                    "video_ids": set(),
+                    "video_snippets": {},
+                    "keywords": set(),
+                },
+            )
+            row["video_ids"].add(video_id)
+            row["video_snippets"][video_id] = snippet
+            row["keywords"].add(keyword)
+
+    if not channel_rows:
+        return [], errors
+
+    channel_details: dict[str, dict] = {}
+    channel_ids = list(channel_rows)
+    for start in range(0, len(channel_ids), 50):
+        batch = channel_ids[start : start + 50]
+        try:
+            payload = request_youtube_json(
+                "channels",
+                {"part": "snippet,statistics", "id": ",".join(batch)},
+            )
+        except Exception as error:
+            errors.append(f"YouTube 频道信息：{error}")
+            continue
+        for item in payload.get("items", []):
+            channel_details[str(item.get("id") or "")] = item
+
+    video_details: dict[str, dict] = {}
+    video_ids = [video_id for row in channel_rows.values() for video_id in row["video_ids"]]
+    for start in range(0, len(video_ids), 50):
+        batch = video_ids[start : start + 50]
+        try:
+            payload = request_youtube_json(
+                "videos",
+                {"part": "snippet,statistics", "id": ",".join(batch)},
+            )
+        except Exception as error:
+            errors.append(f"YouTube 视频信息：{error}")
+            continue
+        for item in payload.get("items", []):
+            video_details[str(item.get("id") or "")] = item
+
+    leads: list[Lead] = []
+    for channel_id, row in channel_rows.items():
+        channel = channel_details.get(channel_id)
+        if not channel:
+            continue
+        snippet = channel.get("snippet") or {}
+        statistics = channel.get("statistics") or {}
+        name = clean_text(str(snippet.get("title") or channel_id))
+        description = clean_text(str(snippet.get("description") or ""))
+        if not likely_individual_creator(name, description, "youtube"):
+            continue
+
+        videos = [video_details[video_id] for video_id in row["video_ids"] if video_id in video_details]
+        videos.sort(
+            key=lambda item: int((item.get("statistics") or {}).get("viewCount", 0) or 0),
+            reverse=True,
+        )
+        view_counts = [parse_metric((video.get("statistics") or {}).get("viewCount")) for video in videos]
+        view_counts = [value for value in view_counts if value is not None]
+        published_dates = [
+            str((video.get("snippet") or {}).get("publishedAt") or "")
+            for video in videos
+            if (video.get("snippet") or {}).get("publishedAt")
+        ]
+        custom_url = str(snippet.get("customUrl") or "").strip()
+        if custom_url:
+            profile_url = f"https://www.youtube.com/{custom_url.lstrip('/')}"
+        else:
+            profile_url = f"https://www.youtube.com/channel/{channel_id}"
+        work_urls = [
+            f"https://www.youtube.com/watch?v={video.get('id')}"
+            for video in videos[:8]
+            if video.get("id")
+        ]
+        subscribers = parse_metric(statistics.get("subscriberCount"))
+        lead = make_lead(
+            platform="youtube",
+            name=name,
+            handle=custom_url or f"@{channel_id}",
+            profile_url=profile_url,
+            bio=description or "YouTube 公开频道",
+            source_query="、".join(sorted(row["keywords"])),
+            source_url=work_urls[0] if work_urls else profile_url,
+            featured_work_urls=work_urls,
+            followers=subscribers,
+            related_posts=len(videos),
+            min_views=max(view_counts) if view_counts else None,
+            last_post_at=max(published_dates) if published_dates else "",
+        )
+        lead.follower_verified = subscribers is not None
+        lead.follower_verified_at = datetime.now(timezone.utc).isoformat(timespec="seconds") if subscribers is not None else ""
+        lead.follower_source = "YouTube Data API" if subscribers is not None else ""
+        lead.data_quality = "YouTube 官方 API"
+        lead.activity_feedback = (
+            f"相关视频 {len(videos)} 条；最高公开播放 {max(view_counts):,}"
+            if view_counts
+            else f"相关视频 {len(videos)} 条；播放量待核验"
+        )
+        lead.verification_status = qualification_status(lead)
+        leads.append(lead)
+
+    ordered = sorted(leads, key=lambda item: (-item.score, -item.activity_score, item.handle.lower()))
+    return ordered[:limit], errors
+
+
 def collect_leads(keywords: list[str], platforms: list[str], limit: int = 50, enrich: bool = True) -> tuple[list[Lead], list[str]]:
     leads: dict[str, Lead] = {}
     errors: list[str] = []
@@ -979,7 +1309,14 @@ def collect_leads(keywords: list[str], platforms: list[str], limit: int = 50, en
             key = lead.profile_url.rstrip("/").lower()
             leads[key] = merge_lead(leads[key], lead) if key in leads else lead
 
-    search_platforms = [platform for platform in platforms if platform not in {"github", "reddit"} and not (platform == "x" and x_api_used)]
+    if "youtube" in platforms:
+        youtube_leads, youtube_errors = search_youtube(keywords, per_platform_limit)
+        errors.extend(youtube_errors)
+        for lead in youtube_leads:
+            key = lead.profile_url.rstrip("/").lower()
+            leads[key] = merge_lead(leads[key], lead) if key in leads else lead
+
+    search_platforms = [platform for platform in platforms if platform not in {"github", "reddit", "youtube"} and not (platform == "x" and x_api_used)]
     queries = build_queries(keywords, search_platforms)
     for query in queries:
         source_url, blocks = search_bing(query)
@@ -1153,7 +1490,7 @@ def read_results() -> list[dict]:
         return []
     if not isinstance(payload, list):
         return []
-    return [row for row in payload if isinstance(row, dict) and row.get("platform") == "X"]
+    return [row for row in payload if isinstance(row, dict) and row.get("platform")]
 
 
 X_VERIFY_LOCK = threading.Lock()
@@ -1620,7 +1957,7 @@ body{margin:0}.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 56px}.hero{
 <section class="panel"><strong>补充导入 X 结果</strong><div class="hint">在 Chrome 的 X 搜索结果页复制你看得到的文字或主页链接，粘贴到下面；程序只抽取公开的 X 主页地址。</div><textarea id="paste" class="input" style="width:100%;min-height:90px;margin-top:12px;box-sizing:border-box" placeholder="例如：@creator_name\nhttps://x.com/creator_name"></textarea><div class="row" style="margin-top:10px"><button class="btn secondary" onclick="importPasted()">导入复制内容</button><span id="importStatus" class="hint"></span></div></section>
 <section class="panel"><div class="row"><strong>名单预览</strong><span id="count" class="hint"></span></div><div class="hint">当前列表是公开线索候选池；粉丝层级、至少 2 条相关内容和播放/浏览量 >100 会在每日任务中继续核验。</div><div class="table-wrap"><table><thead><tr><th>评分</th><th>平台</th><th>创作者</th><th>方向</th><th>公开简介/搜索摘要</th><th>来源</th></tr></thead><tbody id="tbody"></tbody></table></div><div class="footer">建议触达顺序：先看近期开源作品或教程，再通过平台公开入口联系；程序不自动发送任何内容。</div></section></main>
 <script>
-const platformOptions=[['x','X']];
+const platformOptions=[['x','X'],['youtube','YouTube']];
 document.getElementById('platforms').innerHTML=platformOptions.map(([v,l])=>`<label class="check"><input type="checkbox" value="${v}" checked> ${l}</label>`).join('');
 async function runSearch(){const status=document.getElementById('status');status.textContent='正在读取公开搜索结果，请稍等…';const keywords=document.getElementById('keywords').value.split(/[,，\n]+/).map(x=>x.trim()).filter(Boolean);const platforms=[...document.querySelectorAll('#platforms input:checked')].map(x=>x.value);const limit=Number(document.getElementById('limit').value||50);try{const res=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keywords,platforms,limit})});const data=await res.json();if(!res.ok)throw new Error(data.error||'搜索失败');render(data.leads||[]);status.textContent=data.leads.length?`已完成：找到 ${data.leads.length} 条候选名单。${data.errors?.length?'部分来源不可访问，已跳过。':''}`:'公开搜索引擎没有返回可用的 X 主页。请在 Chrome 的 X 搜索结果页复制公开内容，再用下面的“导入复制内容”；这是因为 X 的登录搜索结果不会被普通搜索引擎直接开放给程序。';}catch(e){status.textContent='暂时无法完成搜索：'+e.message;}}
 function render(leads){document.getElementById('count').textContent=`共 ${leads.length} 条候选`;const body=document.getElementById('tbody');body.innerHTML=leads.length?leads.map(x=>`<tr><td class="score">${x.score}</td><td>${x.platform}</td><td><a href="${x.profile_url}" target="_blank">${esc(x.name)}</a><br><span class="hint">${esc(x.handle)}</span></td><td>${(x.categories||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}</td><td>${esc(x.bio||'')}</td><td>${esc(x.source_query||'')}</td></tr>`).join(''):'<tr><td colspan="6" class="empty">还没有名单，先点击“补充找名单”。</td></tr>';}
