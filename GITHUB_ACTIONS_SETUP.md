@@ -13,11 +13,12 @@
 
 1. 新建一个 GitHub 仓库，把 `ai_creator_lead_finder` 文件夹里的内容上传到仓库根目录。
 2. 打开仓库的 `Actions` 页面，确认允许工作流运行。
-3. 可选：在 `Settings → Secrets and variables → Actions` 中新增 `X_BEARER_TOKEN`。只填写 Token 本身，不要提交到文件。
-4. 在 `Actions → AI Creator KOC Daily Crawl` 点击 `Run workflow`，先手动测试一次。
+3. YouTube 现在默认读取公开搜索页，不需要申请或填写 YouTube API 密钥。若以后你有 API 密钥，也可以作为可选加速方式加入，但不是运行条件。
+4. 可选：同样新增 `X_BEARER_TOKEN`，用于补充 X 官方 API 数据。
+5. 在 `Actions → AI Creator KOC Daily Crawl` 点击 `Run workflow`，先手动测试一次。
 
 工作流每天北京时间上午 9:00 自动执行。每次运行会生成运行摘要、更新 `data/leads.json`、`data/leads.csv` 和 `data/runs.jsonl`，同时保留 30 天的下载快照。
 
 ## 当前结果
 
-GitHub Actions 版适合先把公开名单自动跑起来。要补齐 hiCreator 的完整均播、互动率和公开邮箱，后续还需要增加云端浏览器登录层；这不会读取你本机的浏览器登录状态。
+GitHub Actions 版适合先把公开名单自动跑起来。YouTube 接入后会按关键词搜索公开视频，按频道去重，并保存公开订阅数、视频播放量和作品链接；没有 API 密钥时会明确记录错误，不会用搜索摘要冒充 YouTube API 数据。
